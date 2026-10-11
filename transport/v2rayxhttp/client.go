@@ -16,6 +16,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -32,14 +33,19 @@ var _ adapter.V2RayClientTransport = (*Client)(nil)
 // whose response body carries the downlink. This is the mode Xray picks automatically for
 // REALITY connections without `download_settings`, which is the common case.
 type Client struct {
-	dialer     N.Dialer
-	serverAddr M.Socksaddr
-	requestURL url.URL
-	host       string
-	headers    http.Header
-	method     string
-	httpClient *http.Client
-	noGRPC     bool
+	// uplink
+	uploadURL    url.URL
+	uploadClient *http.Client
+	uploadHost   string
+	// downlink — may point at a different server (Xray's downloadSettings)
+	downloadURL    url.URL
+	downloadClient *http.Client
+	downloadHost   string
+
+	headers http.Header
+	method  string
+	mode    string
+	noGRPC  bool
 
 	paddingFrom int
 	paddingTo   int
@@ -48,63 +54,35 @@ type Client struct {
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (*Client, error) {
-	// xhttp's stream-one mode needs a full-duplex HTTP connection: the uplink streams in the
-	// request body while the downlink streams out of the response body. Over HTTP/1.1 the server
-	// cannot answer before the request body ends, so this only works over HTTP/2 — including
-	// h2c (prior-knowledge) when there is no TLS.
-	var roundTripper http.RoundTripper
-	if tlsConfig == nil {
-		roundTripper = &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(dialContext context.Context, network string, addr string, cfg *stdtls.Config) (net.Conn, error) {
-				return dialer.DialContext(dialContext, N.NetworkTCP, serverAddr)
-			},
-		}
-	} else {
-		stdConfig, err := tlsConfig.STDConfig()
-		if err != nil {
-			return nil, E.Cause(err, "build tls config")
-		}
-		if len(stdConfig.NextProtos) == 0 {
-			stdConfig.NextProtos = []string{"h2", "http/1.1"}
-		}
-		roundTripper = &http.Transport{
-			ForceAttemptHTTP2: true,
-			TLSClientConfig:   stdConfig,
-			DialContext: func(dialContext context.Context, network string, addr string) (net.Conn, error) {
-				return dialer.DialContext(dialContext, N.NetworkTCP, serverAddr)
-			},
-			IdleConnTimeout: 90 * time.Second,
-		}
-	}
-
-	var host string
-	if options.Host != "" {
-		host = options.Host
-	} else if tlsConfig != nil && tlsConfig.ServerName() != "" {
-		host = tlsConfig.ServerName()
-	} else {
-		host = serverAddr.String()
-	}
-
-	var requestURL url.URL
-	if tlsConfig == nil {
-		requestURL.Scheme = "http"
-	} else {
-		requestURL.Scheme = "https"
-	}
-	requestURL.Host = serverAddr.String()
-	err := sHTTP.URLSetPath(&requestURL, options.Path)
+	uploadURL, uploadHost, err := buildRequestURL(serverAddr, options.Host, options.Path, tlsConfig)
 	if err != nil {
-		return nil, E.Cause(err, "parse path")
+		return nil, err
 	}
-	if !strings.HasPrefix(requestURL.Path, "/") {
-		requestURL.Path = "/" + requestURL.Path
+	uploadClient, err := newHTTPClient(dialer, serverAddr, tlsConfig)
+	if err != nil {
+		return nil, err
 	}
-	// Xray's default session/seq placement is `path`, so GetNormalizedPath() keeps a trailing
-	// slash and the server matches with HasPrefix(path).
-	if !strings.HasSuffix(requestURL.Path, "/") {
-		requestURL.Path += "/"
+
+	// Downlink may use a different server (Xray's downloadSettings).
+	downloadURL, downloadHost, downloadClient := uploadURL, uploadHost, uploadClient
+	if options.DownloadSettings != nil {
+		settings := options.DownloadSettings
+		downloadAddr := M.ParseSocksaddrHostPort(settings.Server, settings.Port)
+		var downloadTLSConfig tls.Config
+		if settings.TLS != nil {
+			downloadTLSConfig, err = tls.NewClient(ctx, log.NewNOPFactory().Logger(), settings.Server, *settings.TLS)
+			if err != nil {
+				return nil, E.Cause(err, "build download tls config")
+			}
+		}
+		downloadURL, downloadHost, err = buildRequestURL(downloadAddr, settings.Host, settings.Path, downloadTLSConfig)
+		if err != nil {
+			return nil, err
+		}
+		downloadClient, err = newHTTPClient(dialer, downloadAddr, downloadTLSConfig)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	headers := make(http.Header)
@@ -115,6 +93,15 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	method := options.UplinkHTTPMethod
 	if method == "" {
 		method = http.MethodPost
+	}
+
+	mode := options.Mode
+	if mode == "" || mode == "auto" {
+		if options.DownloadSettings != nil {
+			mode = "stream-up"
+		} else {
+			mode = "stream-one"
+		}
 	}
 
 	paddingFrom, paddingTo := 100, 1000
@@ -141,69 +128,67 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 
 	return &Client{
-		dialer:      dialer,
-		serverAddr:  serverAddr,
-		requestURL:  requestURL,
-		host:        host,
-		headers:     headers,
-		method:      method,
-		httpClient:  &http.Client{Transport: roundTripper},
-		noGRPC:      options.NoGRPCHeader,
-		paddingFrom: paddingFrom,
-		paddingTo:   paddingTo,
-		paddingKey:  paddingKey,
-		paddingHdr:  paddingHeader,
+		uploadURL:      uploadURL,
+		uploadClient:   uploadClient,
+		uploadHost:     uploadHost,
+		downloadURL:    downloadURL,
+		downloadClient: downloadClient,
+		downloadHost:   downloadHost,
+		headers:        headers,
+		method:         method,
+		mode:           mode,
+		noGRPC:         options.NoGRPCHeader,
+		paddingFrom:    paddingFrom,
+		paddingTo:      paddingTo,
+		paddingKey:     paddingKey,
+		paddingHdr:     paddingHeader,
 	}, nil
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+	if c.mode == "stream-up" {
+		return c.dialStreamUp(ctx)
+	}
+	return c.dialStreamOne(ctx)
+}
+
+// dialStreamOne opens a single request: the request body carries the uplink and the response body
+// carries the downlink. Xray picks this mode for REALITY connections without download_settings.
+func (c *Client) dialStreamOne(ctx context.Context) (net.Conn, error) {
 	pipeReader, pipeWriter := io.Pipe()
-
-	request := (&http.Request{
-		Method: c.method,
-		URL:    &c.requestURL,
-		Host:   c.host,
-		Header: c.headers.Clone(),
-		Body:   pipeReader,
-	}).WithContext(context.WithoutCancel(ctx))
-
+	request := c.newRequest(ctx, c.method, c.uploadURL, c.uploadHost, pipeReader)
 	if !c.noGRPC {
 		request.Header.Set("Content-Type", "application/grpc")
 	}
-	c.applyXPadding(request)
+	c.applyXPadding(request, c.uploadURL)
 
+	reader := &waitReader{wait: make(chan struct{})}
 	gotConn := make(chan struct{})
 	var remoteAddr, localAddr net.Addr
 	var gotConnOnce sync.Once
-	traceCtx := httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
 			remoteAddr = info.Conn.RemoteAddr()
 			localAddr = info.Conn.LocalAddr()
 			gotConnOnce.Do(func() { close(gotConn) })
 		},
-	})
-	request = request.WithContext(traceCtx)
+	}))
 
-	conn := &Conn{
-		reader:     &waitReader{wait: make(chan struct{})},
-		writer:     pipeWriter,
-		pipeReader: pipeReader,
-	}
 	go func() {
-		response, err := c.httpClient.Do(request)
+		response, err := c.uploadClient.Do(request)
 		if err != nil {
-			conn.reader.closeWith(err)
+			reader.closeWith(err)
 			pipeReader.CloseWithError(err)
 			gotConnOnce.Do(func() { close(gotConn) })
 			return
 		}
 		if response.StatusCode != http.StatusOK {
-			conn.reader.closeWith(E.New("unexpected status: ", response.Status))
+			reader.closeWith(E.New("unexpected status: ", response.Status))
 			response.Body.Close()
 			pipeReader.Close()
 			return
 		}
-		conn.reader.set(response.Body)
+		reader.set(response.Body)
 	}()
 
 	select {
@@ -212,12 +197,80 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		pipeReader.CloseWithError(ctx.Err())
 		return nil, ctx.Err()
 	}
-	conn.remoteAddr = remoteAddr
-	conn.localAddr = localAddr
+	return &Conn{
+		reader:     reader,
+		writer:     pipeWriter,
+		pipeReader: pipeReader,
+		remoteAddr: remoteAddr,
+		localAddr:  localAddr,
+	}, nil
+}
+
+// dialStreamUp opens two requests that the server correlates by session id: a GET carrying the
+// downlink and a long-lived POST carrying the uplink. The downlink may use a different server.
+func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
+	sessionID := generateSessionID()
+
+	// uplink first: a single request whose body never ends until the connection closes
+	uploadPipeReader, uploadPipeWriter := io.Pipe()
+	uploadRequest := c.newRequest(ctx, c.method, withSession(c.uploadURL, sessionID), c.uploadHost, uploadPipeReader)
+	if !c.noGRPC {
+		uploadRequest.Header.Set("Content-Type", "application/grpc")
+	}
+	c.applyXPadding(uploadRequest, c.uploadURL)
+
+	uploadDone := make(chan error, 1)
+	go func() {
+		response, err := c.uploadClient.Do(uploadRequest)
+		if err != nil {
+			uploadDone <- err
+			return
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		uploadDone <- nil
+	}()
+
+	// downlink: a GET whose response body is the stream
+	downloadRequest := c.newRequest(ctx, http.MethodGet, withSession(c.downloadURL, sessionID), c.downloadHost, nil)
+	c.applyXPadding(downloadRequest, c.downloadURL)
+	response, err := c.downloadClient.Do(downloadRequest)
+	if err != nil {
+		uploadPipeReader.CloseWithError(err)
+		return nil, E.Cause(err, "open download stream")
+	}
+	if response.StatusCode != http.StatusOK {
+		uploadPipeReader.CloseWithError(E.New("unexpected status: ", response.Status))
+		response.Body.Close()
+		return nil, E.New("unexpected status: ", response.Status)
+	}
+
+	downlinkReader := &waitReader{wait: make(chan struct{})}
+	downlinkReader.set(response.Body)
+	conn := &Conn{
+		reader:     downlinkReader,
+		writer:     uploadPipeWriter,
+		pipeReader: uploadPipeReader,
+	}
+	go func() {
+		if uploadErr := <-uploadDone; uploadErr != nil {
+			conn.Close()
+		}
+	}()
 	return conn, nil
 }
 
-func (c *Client) applyXPadding(request *http.Request) {
+func (c *Client) newRequest(ctx context.Context, method string, requestURL url.URL, host string, body io.ReadCloser) *http.Request {
+	return (&http.Request{
+		Method: method,
+		URL:    &requestURL,
+		Host:   host,
+		Header: c.headers.Clone(),
+		Body:   body,
+	}).WithContext(context.WithoutCancel(ctx))
+}
+
+func (c *Client) applyXPadding(request *http.Request, baseURL url.URL) {
 	if c.paddingTo <= 0 {
 		return
 	}
@@ -228,23 +281,115 @@ func (c *Client) applyXPadding(request *http.Request) {
 	if length <= 0 {
 		return
 	}
-	// Xray's default placement is "query in header": the request URL with a `x_padding` query
-	// is written into the Referer header.
-	paddingURL := c.requestURL
+	paddingURL := baseURL
 	query := paddingURL.Query()
 	query.Set(c.paddingKey, strings.Repeat("X", length))
 	paddingURL.RawQuery = query.Encode()
 	request.Header.Set(c.paddingHdr, paddingURL.String())
 }
 
+// buildRequestURL derives the request URL and Host header for a server, mirroring Xray's
+// GetNormalizedPath(): the default session/seq placement is `path`, so the path keeps a trailing
+// slash and the server matches it with HasPrefix.
+func buildRequestURL(serverAddr M.Socksaddr, host string, path string, tlsConfig tls.Config) (url.URL, string, error) {
+	var requestURL url.URL
+	if tlsConfig == nil {
+		requestURL.Scheme = "http"
+	} else {
+		requestURL.Scheme = "https"
+	}
+	requestURL.Host = serverAddr.String()
+	if err := sHTTP.URLSetPath(&requestURL, path); err != nil {
+		return url.URL{}, "", E.Cause(err, "parse path")
+	}
+	if !strings.HasPrefix(requestURL.Path, "/") {
+		requestURL.Path = "/" + requestURL.Path
+	}
+	if !strings.HasSuffix(requestURL.Path, "/") {
+		requestURL.Path += "/"
+	}
+
+	var requestHost string
+	switch {
+	case host != "":
+		requestHost = host
+	case tlsConfig != nil && tlsConfig.ServerName() != "":
+		requestHost = tlsConfig.ServerName()
+	default:
+		requestHost = serverAddr.String()
+	}
+	return requestURL, requestHost, nil
+}
+
+// newHTTPClient builds an HTTP/2 client over the given dialer.
+//
+// xhttp needs full-duplex HTTP: over HTTP/1.1 the server cannot answer before the request body
+// ends, so h2 (over TLS) or h2c (prior knowledge, no TLS) is required.
+func newHTTPClient(dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.Config) (*http.Client, error) {
+	if tlsConfig == nil {
+		return &http.Client{Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(dialContext context.Context, network string, addr string, cfg *stdtls.Config) (net.Conn, error) {
+				return dialer.DialContext(dialContext, N.NetworkTCP, serverAddr)
+			},
+		}}, nil
+	}
+	stdConfig, err := tlsConfig.STDConfig()
+	if err != nil {
+		return nil, E.Cause(err, "build tls config")
+	}
+	if len(stdConfig.NextProtos) == 0 {
+		stdConfig.NextProtos = []string{"h2", "http/1.1"}
+	}
+	return &http.Client{Transport: &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig:   stdConfig,
+		DialContext: func(dialContext context.Context, network string, addr string) (net.Conn, error) {
+			return dialer.DialContext(dialContext, N.NetworkTCP, serverAddr)
+		},
+		IdleConnTimeout: 90 * time.Second,
+	}}, nil
+}
+
+// withSession appends the session id to the path, matching Xray's appendToPath().
+func withSession(base url.URL, sessionID string) url.URL {
+	result := base
+	if strings.HasSuffix(result.Path, "/") {
+		result.Path += sessionID
+	} else {
+		result.Path += "/" + sessionID
+	}
+	return result
+}
+
+const sessionIDTable = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+func generateSessionID() string {
+	id := make([]byte, 16)
+	for i := range id {
+		id[i] = sessionIDTable[rand.IntN(len(sessionIDTable))]
+	}
+	return string(id)
+}
+
 func (c *Client) Close() error {
-	switch transport := c.httpClient.Transport.(type) {
+	closeIdle(c.uploadClient)
+	if c.downloadClient != c.uploadClient {
+		closeIdle(c.downloadClient)
+	}
+	return nil
+}
+
+func closeIdle(client *http.Client) {
+	if client == nil {
+		return
+	}
+	switch transport := client.Transport.(type) {
 	case *http.Transport:
 		transport.CloseIdleConnections()
 	case *http2.Transport:
 		transport.CloseIdleConnections()
 	}
-	return nil
 }
 
 // Conn adapts an in-flight HTTP request/response pair into a net.Conn: writes go into the request
