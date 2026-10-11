@@ -133,4 +133,15 @@ type V2RayXHTTPOptions struct {
 	XPaddingHeader    string               `json:"x_padding_header,omitempty"`
 	XPaddingPlacement string               `json:"x_padding_placement,omitempty"`
 	XPaddingMethod    string               `json:"x_padding_method,omitempty"`
+	// Optional separate connection for the downlink (Xray's downloadSettings).
+	DownloadSettings *V2RayXHTTPDownloadOptions `json:"download_settings,omitempty"`
+}
+
+// V2RayXHTTPDownloadOptions mirrors the downloadSettings of Xray's xhttp transport.
+type V2RayXHTTPDownloadOptions struct {
+	Server string               `json:"server,omitempty"`
+	Port   uint16               `json:"port,omitempty"`
+	Host   string               `json:"host,omitempty"`
+	Path   string               `json:"path,omitempty"`
+	TLS    *OutboundTLSOptions  `json:"tls,omitempty"`
 }
