@@ -45,10 +45,11 @@ import (
 var _ ConfigCompat = (*RealityClientConfig)(nil)
 
 type RealityClientConfig struct {
-	ctx       context.Context
-	uClient   *UTLSClientConfig
-	publicKey []byte
-	shortID   [8]byte
+	ctx                   context.Context
+	uClient               *UTLSClientConfig
+	publicKey             []byte
+	shortID               [8]byte
+	supportX25519MLKEM768 bool
 }
 
 func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
@@ -84,7 +85,13 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid short_id")
 	}
 
-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
+	var config Config = &RealityClientConfig{
+		ctx:                   ctx,
+		uClient:               uClient.(*UTLSClientConfig),
+		publicKey:             publicKey,
+		shortID:               shortID,
+		supportX25519MLKEM768: options.Reality.SupportX25519MLKEM768,
+	}
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -145,16 +152,22 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	if err != nil {
 		return nil, err
 	}
-	for _, extension := range uConn.Extensions {
-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
-				return curveID != utls.X25519MLKEM768
-			})
-		}
-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
+	if !e.supportX25519MLKEM768 {
+		// Drop the post-quantum hybrid unless the server is known to support it.
+		// Xray-core before v26.9.8 rejects a ClientHello carrying the extra key
+		// share, and uTLS offers it by default — so the safe default is to strip
+		// it and let a server that announces support opt back in.
+		for _, extension := range uConn.Extensions {
+			if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+				ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+					return curveID != utls.X25519MLKEM768
+				})
+			}
+			if ks, ok := extension.(*utls.KeyShareExtension); ok {
+				ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+					return share.Group != utls.X25519MLKEM768
+				})
+			}
 		}
 	}
 	err = uConn.BuildHandshakeState()
@@ -267,10 +280,11 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 
 func (e *RealityClientConfig) Clone() Config {
 	return &RealityClientConfig{
-		e.ctx,
-		e.uClient.Clone().(*UTLSClientConfig),
-		e.publicKey,
-		e.shortID,
+		ctx:                   e.ctx,
+		uClient:               e.uClient.Clone().(*UTLSClientConfig),
+		publicKey:             e.publicKey,
+		shortID:               e.shortID,
+		supportX25519MLKEM768: e.supportX25519MLKEM768,
 	}
 }
 

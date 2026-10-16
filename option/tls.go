@@ -253,4 +253,12 @@ type OutboundRealityOptions struct {
 	Enabled   bool   `json:"enabled,omitempty"`
 	PublicKey string `json:"public_key,omitempty"`
 	ShortID   string `json:"short_id,omitempty"`
+
+	// SupportX25519MLKEM768 advertises the post-quantum hybrid key share to the
+	// server. Off by default: REALITY servers built on Xray-core before v26.9.8
+	// reject the extra key share outright, so a client that always offers it
+	// cannot connect to them. The server announces its own support
+	// (support-x25519mlkem768 in its REALITY settings), and this is the client
+	// half of that handshake.
+	SupportX25519MLKEM768 bool `json:"support_x25519mlkem768,omitempty"`
 }
