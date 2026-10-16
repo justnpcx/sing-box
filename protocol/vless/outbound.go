@@ -92,11 +92,21 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			return nil, E.New("unknown packet encoding: ", *options.PacketEncoding)
 		}
 	}
+	// VLESS flow and multiplex are mutually exclusive: flow (xtls-rprx-vision)
+	// is a stream-level protocol and mux wraps the stream, so a server handed
+	// both rejects the connection. Multiplex wins because it is the setting the
+	// user turned on explicitly; flow is dropped rather than failing the whole
+	// outbound. Starveil's config builder emits both when a node carries both,
+	// so this is reachable from the UI, not theoretical.
+	muxOptions := common.PtrValueOrDefault(options.Multiplex)
+	if muxOptions.Enabled {
+		options.Flow = ""
+	}
 	outbound.client, err = vless.NewClient(options.UUID, options.Flow, logger)
 	if err != nil {
 		return nil, err
 	}
-	outbound.multiplexDialer, err = mux.NewClientWithOptions((*vlessDialer)(outbound), logger, common.PtrValueOrDefault(options.Multiplex))
+	outbound.multiplexDialer, err = mux.NewClientWithOptions((*vlessDialer)(outbound), logger, muxOptions)
 	if err != nil {
 		return nil, err
 	}
