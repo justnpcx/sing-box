@@ -325,6 +325,12 @@ func buildRequestURL(serverAddr M.Socksaddr, host string, path string, tlsConfig
 //
 // xhttp needs full-duplex HTTP: over HTTP/1.1 the server cannot answer before the request body
 // ends, so h2 (over TLS) or h2c (prior knowledge, no TLS) is required.
+//
+// The handshake happens here rather than inside net/http. http.Transport insists on a
+// crypto/tls.Config, and REALITY cannot produce one — its ClientHello is assembled by uTLS, so
+// STDConfig() answers "unsupported usage for reality" and every REALITY node failed at outbound
+// init. http2.Transport will take a connection that is already handshaken, so the same tls.Config
+// works for REALITY and for ordinary TLS alike. This is the pattern v2raygrpc already uses.
 func newHTTPClient(dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.Config) (*http.Client, error) {
 	if tlsConfig == nil {
 		return &http.Client{Transport: &http2.Transport{
@@ -334,20 +340,24 @@ func newHTTPClient(dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig tls.Config
 			},
 		}}, nil
 	}
-	stdConfig, err := tlsConfig.STDConfig()
-	if err != nil {
-		return nil, E.Cause(err, "build tls config")
-	}
-	if len(stdConfig.NextProtos) == 0 {
-		stdConfig.NextProtos = []string{"h2", "http/1.1"}
-	}
-	return &http.Client{Transport: &http.Transport{
-		ForceAttemptHTTP2: true,
-		TLSClientConfig:   stdConfig,
-		DialContext: func(dialContext context.Context, network string, addr string) (net.Conn, error) {
-			return dialer.DialContext(dialContext, N.NetworkTCP, serverAddr)
+	return &http.Client{Transport: &http2.Transport{
+		DialTLSContext: func(dialContext context.Context, network string, addr string, cfg *stdtls.Config) (net.Conn, error) {
+			conn, err := dialer.DialContext(dialContext, N.NetworkTCP, serverAddr)
+			if err != nil {
+				return nil, err
+			}
+			// Cloned per connection: SetNextProtos mutates, and the uplink and downlink clients
+			// share this config. h2 is the only protocol an http2.Transport can speak, and the
+			// connection it is handed is assumed to have negotiated it.
+			handshakeConfig := tlsConfig.Clone()
+			handshakeConfig.SetNextProtos([]string{"h2"})
+			tlsConn, err := tls.ClientHandshake(dialContext, conn, handshakeConfig)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
 		},
-		IdleConnTimeout: 90 * time.Second,
 	}}, nil
 }
 
