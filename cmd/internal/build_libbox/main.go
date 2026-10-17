@@ -69,6 +69,14 @@ func init() {
 	sharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")
 	notMemcTags = append(notMemcTags, "with_low_memory")
 	debugTags = append(debugTags, "debug")
+	// Starveil: the default list carries every outbound sing-box supports,
+	// including tailscale, naive (which links cronet-go) and two VPN clients.
+	// None of them are reachable from this app, and they are most of the
+	// binary. LIBBOX_TAGS replaces the list for a trimmed build.
+	if override := os.Getenv("LIBBOX_TAGS"); override != "" {
+		sharedTags = strings.Split(override, ",")
+	}
+	log.Info("tags: ", strings.Join(sharedTags, ","))
 }
 
 type AndroidBuildConfig struct {
