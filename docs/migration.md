@@ -2,6 +2,43 @@
 icon: material/arrange-bring-forward
 ---
 
+## 1.15.0
+
+### Migrate TUN stack
+
+Since 1.15.0, sing-tun uses its own TCP/IP stack, with substantial improvements over all previous
+implementations in peak performance, energy efficiency, and memory usage.
+Remove the `stack` option to use it.
+
+The `stack` option is deprecated in sing-box 1.15.0 and will be removed in sing-box 1.17.0.
+
+=== ":material-card-remove: Deprecated"
+
+    ```json
+    {
+      "inbounds": [
+        {
+          "type": "tun",
+          "address": ["172.18.0.1/30"],
+          "stack": "system"
+        }
+      ]
+    }
+    ```
+
+=== ":material-card-multiple: Migrated"
+
+    ```json
+    {
+      "inbounds": [
+        {
+          "type": "tun",
+          "address": ["172.18.0.1/30"]
+        }
+      ]
+    }
+    ```
+
 ## 1.14.0
 
 ### Migrate the macOS standalone client data
@@ -545,7 +582,7 @@ DNS servers are refactored for better performance and scalability.
             "fakeip": {
               "enabled": true,
               "inet4_range": "198.18.0.0/15",
-              "inet6_range": "fc00::/18"
+              "inet6_range": "2001:2::/48"
             }
           }
         }
@@ -565,7 +602,7 @@ DNS servers are refactored for better performance and scalability.
                 "type": "fakeip",
                 "tag": "fakeip",
                 "inet4_range": "198.18.0.0/15",
-                "inet6_range": "fc00::/18"
+                "inet6_range": "2001:2::/48"
               }
             ],
             "rules": [

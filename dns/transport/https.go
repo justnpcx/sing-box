@@ -5,15 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
@@ -26,7 +25,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	sHTTP "github.com/sagernet/sing/protocol/http"
 
 	mDNS "github.com/miekg/dns"
 	"golang.org/x/net/http2"
@@ -82,21 +80,20 @@ func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options
 			host = options.Server
 		}
 	}
-	destinationURL := url.URL{
-		Scheme: "https",
-		Host:   host,
-	}
-	if destinationURL.Host == "" {
-		destinationURL.Host = options.Server
-	}
+	destinationAddress := M.ParseSocksaddrHostPort(host, options.ServerPort)
+	destinationURL := url.URL{Scheme: "https"}
 	if options.ServerPort != 0 && options.ServerPort != 443 {
-		destinationURL.Host = net.JoinHostPort(destinationURL.Host, strconv.Itoa(int(options.ServerPort)))
+		destinationURL.Host = destinationAddress.String()
+	} else if destinationAddress.IsIPv6() {
+		destinationURL.Host = "[" + destinationAddress.AddrString() + "]"
+	} else {
+		destinationURL.Host = destinationAddress.AddrString()
 	}
 	path := options.Path
 	if path == "" {
 		path = "/dns-query"
 	}
-	err = sHTTP.URLSetPath(&destinationURL, path)
+	err = badhttp.URLSetPath(&destinationURL, path)
 	if err != nil {
 		return nil, err
 	}

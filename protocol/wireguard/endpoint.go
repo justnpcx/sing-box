@@ -15,6 +15,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/oomkiller"
 	"github.com/sagernet/sing-box/transport/wireguard"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
@@ -29,6 +30,8 @@ import (
 var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
+	_ adapter.OutboundWithMultiplex       = (*Endpoint)(nil)
+	_ adapter.OnDemandEndpoint            = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
 )
 
@@ -43,7 +46,10 @@ type Endpoint struct {
 	dnsRouter      adapter.DNSRouter
 	logger         logger.ContextLogger
 	localAddresses []netip.Prefix
+	system         bool
+	network        adapter.NetworkManager
 	endpoint       *wireguard.Endpoint
+	onDemand       bool
 	bindAccess     sync.Mutex
 	started        atomic.Bool
 }
@@ -56,6 +62,8 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
 		logger:         logger,
 		localAddresses: options.Address,
+		system:         options.System,
+		onDemand:       options.OnDemand,
 	}
 	if options.Detour != "" && options.ListenPort != 0 {
 		return nil, E.New("`listen_port` is conflict with `detour`")
@@ -78,6 +86,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		udpTimeout = C.UDPTimeout
 	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
+	ep.network = networkManager
 	wgEndpoint, err := wireguard.NewEndpoint(wireguard.EndpointOptions{
 		Context:         ctx,
 		Logger:          logger,
@@ -93,7 +102,6 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 			Logger:           logger,
 			InterfaceFinder:  networkManager.InterfaceFinder(),
 			InterfaceMonitor: networkManager.InterfaceMonitor(),
-			ExcludeInterface: options.Name,
 			IsExempt: func() bool {
 				return networkManager.AutoRedirectOutputMark() != 0
 			},
@@ -137,6 +145,10 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 func (w *Endpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
+		err := w.endpoint.Initialize(oomkiller.MemoryPressure(w.ctx))
+		if err != nil {
+			return err
+		}
 		scope.Add(w.endpoint.Close)
 	case adapter.StartStateStart:
 		return w.endpoint.Start(false)
@@ -156,11 +168,23 @@ func (w *Endpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	return nil
 }
 
+func (w *Endpoint) MultiplexEnabled() bool {
+	return true
+}
+
 func (w *Endpoint) InterfaceUpdated(ctx context.Context) {
 	if !w.started.Load() {
 		return
 	}
 	go w.updateBind(ctx)
+}
+
+func (w *Endpoint) OnDemand() bool {
+	return w.onDemand
+}
+
+func (w *Endpoint) SetKeepIdleConnections(keep bool) {
+	w.endpoint.SetIdle(!keep)
 }
 
 func (w *Endpoint) updateBind(ctx context.Context) {
@@ -187,6 +211,10 @@ func (w *Endpoint) PortMTU() uint32 {
 	return w.endpoint.PortMTU()
 }
 
+func (w *Endpoint) UpstreamPort() any {
+	return w.endpoint
+}
+
 func (w *Endpoint) AttachReturn(returnPath tun.Return) error {
 	return w.endpoint.AttachReturn(returnPath)
 }
@@ -198,10 +226,13 @@ func (w *Endpoint) DetachReturn(returnPath tun.Return) error {
 func (w *Endpoint) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
 	for _, localPrefix := range w.localAddresses {
 		if localPrefix.Contains(destination.Addr()) {
-			return tun.FlowVerdict{Action: tun.ActionAccept}
+			if w.system {
+				return tun.FlowVerdict{Action: tun.ActionAccept}
+			}
+			return adapter.JudgeHostFlow(w.ctx, w.network, w.logger, network, source, destination)
 		}
 	}
-	return adapter.JudgeFlow(w.router, w.Tag(), w.Type(), network, source, destination, firstPacket)
+	return adapter.JudgeFlow(w.router, adapter.InboundContext{Inbound: w.Tag(), InboundType: w.Type()}, network, source, destination, firstPacket)
 }
 
 func (w *Endpoint) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {

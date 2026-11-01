@@ -2,6 +2,42 @@
 icon: material/arrange-bring-forward
 ---
 
+## 1.15.0
+
+### 迁移 TUN stack
+
+自 1.15.0 起，sing-tun 使用自有 TCP/IP stack，极限性能、能效以及内存占用均大幅领先于所有旧实现。
+移除 `stack` 参数以使用。
+
+`stack` 参数自 sing-box 1.15.0 起废弃，并将在 sing-box 1.17.0 中被移除。
+
+=== ":material-card-remove: 已废弃"
+
+    ```json
+    {
+      "inbounds": [
+        {
+          "type": "tun",
+          "address": ["172.18.0.1/30"],
+          "stack": "system"
+        }
+      ]
+    }
+    ```
+
+=== ":material-card-multiple: 已迁移"
+
+    ```json
+    {
+      "inbounds": [
+        {
+          "type": "tun",
+          "address": ["172.18.0.1/30"]
+        }
+      ]
+    }
+    ```
+
 ## 1.14.0
 
 ### 迁移 macOS standalone 客户端数据
@@ -540,7 +576,7 @@ DNS 服务器已经重构。
             "fakeip": {
               "enabled": true,
               "inet4_range": "198.18.0.0/15",
-              "inet6_range": "fc00::/18"
+              "inet6_range": "2001:2::/48"
             }
           }
         }
@@ -560,7 +596,7 @@ DNS 服务器已经重构。
                 "type": "fakeip",
                 "tag": "fakeip",
                 "inet4_range": "198.18.0.0/15",
-                "inet6_range": "fc00::/18"
+                "inet6_range": "2001:2::/48"
               }
             ],
             "rules": [

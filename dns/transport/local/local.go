@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 
@@ -12,8 +13,10 @@ import (
 	"github.com/sagernet/sing-box/dns/transport/mdns"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
 	mDNS "github.com/miekg/dns"
@@ -26,6 +29,7 @@ func RegisterTransport(registry *dns.TransportRegistry) {
 var (
 	_ adapter.DNSTransport                    = (*Transport)(nil)
 	_ adapter.DNSTransportWithPreferredDomain = (*Transport)(nil)
+	_ adapter.DNSTransportWithConfiguration   = (*Transport)(nil)
 	_ adapter.DNSTransportWithEnvironment     = (*Transport)(nil)
 )
 
@@ -70,7 +74,7 @@ func (t *Transport) Start(stage adapter.StartStage, scope *adapter.Scope) error 
 	switch stage {
 	case adapter.StartStateInitialize:
 		scope.Add(t.configSource.Close)
-		if !t.preferGo && isSystemdResolvedManaged() {
+		if !t.preferGo {
 			resolvedResolver, err := NewResolvedResolver(t.ctx, t.logger)
 			if err == nil {
 				scope.Add(resolvedResolver.Close)
@@ -132,11 +136,26 @@ func (t *Transport) PreferredDomain(domain string) bool {
 	return t.preferredResolver.PreferredDomain(domain)
 }
 
+func (t *Transport) ServerAddresses() []netip.Addr {
+	systemConfig := t.configSource.Configuration()
+	if t.resolved != nil && systemConfig.SystemdResolved {
+		return t.resolved.ServerAddresses()
+	}
+	return common.Map(systemConfig.Servers, func(it M.Socksaddr) netip.Addr {
+		return it.Addr
+	})
+}
+
+func (t *Transport) SearchDomains() []string {
+	return t.configSource.Configuration().Search
+}
+
 func (t *Transport) Environment() []string {
-	if t.resolved != nil {
+	systemConfig := t.configSource.Configuration()
+	if t.resolved != nil && systemConfig.SystemdResolved {
 		return t.resolved.Environment()
 	}
-	return t.configSource.Configuration().Signature()
+	return systemConfig.Signature()
 }
 
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
@@ -169,9 +188,10 @@ func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callba
 		t.mdnsTransport.ExchangeAsync(ctx, message, callback)
 		return
 	}
-	if t.resolved != nil {
+	systemConfig := t.configSource.Configuration()
+	if t.resolved != nil && systemConfig.SystemdResolved {
 		t.resolved.ExchangeAsync(ctx, message, callback)
 		return
 	}
-	t.exchangeAsync(ctx, message, question.Name, callback)
+	t.exchangeAsync(ctx, message, systemConfig, callback)
 }
